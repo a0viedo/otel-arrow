@@ -39,8 +39,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: stable
-      - name: Initialize required build cache
+      - name: Check for exact required build cache
+        id: probe
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          shared-key: build_required
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+          lookup-only: true
+          save-if: false
+      - name: Restore required build cache
         id: rust-cache
+        if: steps.probe.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v1-rust
@@ -48,21 +59,20 @@ jobs:
           workspaces: ./rust/otap-dataflow
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Exact hits already contain the reusable dependency artifacts. A miss
-      # or fallback restore must compile so the post step can save the new key.
+      # A skipped restore has no output. Only a miss or fallback needs a build.
       - name: Free disk space
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.rust-cache.outputs.cache-hit == 'false'
         run: |
           sudo rm -rf /usr/lib/jvm /usr/share/dotnet /usr/share/swift /usr/local/.ghcup
           sudo rm -rf /usr/local/julia* /usr/local/lib/android /usr/local/share/chromium
           sudo rm -rf /opt/microsoft /opt/google /opt/az /usr/local/share/powershell
       - name: Install nextest
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.rust-cache.outputs.cache-hit == 'false'
         uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-nextest
       - name: Warm required build cache
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.rust-cache.outputs.cache-hit == 'false'
         run: cargo nextest list --locked --all-features --workspace --list-type binaries-only --message-format json
         working-directory: ./rust/otap-dataflow
 
@@ -80,36 +90,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: stable
-      - name: Initialize required build cache
-        id: rust-cache
+      - name: Check for exact required build cache
+        id: probe
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v1-rust
           shared-key: build_required
-          # Bump in both Windows cache steps when the synchronized feature set changes.
-          key: windows-features-v5
+          key: &windows-feature-key windows-features-v5
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+          lookup-only: true
+          save-if: false
+      - name: Restore required build cache
+        id: rust-cache
+        if: steps.probe.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          shared-key: build_required
+          key: *windows-feature-key
           workspaces: ./rust/otap-dataflow
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Exact hits already contain the reusable dependency artifacts. A miss
-      # or fallback restore must compile so the post step can save the new key.
+      # A skipped restore has no output. Only a miss or fallback needs a build.
       - name: Install SymCrypt # zizmor: ignore[self-repository] This job intentionally runs the checked-in CI action.
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.rust-cache.outputs.cache-hit == 'false'
         uses: ./.github/actions/install-symcrypt
       - name: Free disk space
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.rust-cache.outputs.cache-hit == 'false'
         shell: pwsh
         run: |
           if (Test-Path "C:\Android") { Remove-Item -Recurse -Force "C:\Android" }
           if (Test-Path "C:\SeleniumWebDrivers") { Remove-Item -Recurse -Force "C:\SeleniumWebDrivers" }
           if (Test-Path "C:\imagemagick") { Remove-Item -Recurse -Force "C:\imagemagick" }
       - name: Install nextest
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.rust-cache.outputs.cache-hit == 'false'
         uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-nextest
       - name: Warm required build cache
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.rust-cache.outputs.cache-hit == 'false'
         # Keep the feature set synchronized with rust-ci.yml's required Windows build.
         run: cargo nextest list --locked --no-default-features --features=crypto-symcrypt,mimalloc,azure,aws,azure-monitor,geneva,contrib-processors,oauth2-client-auth,windows-perf-counters,sql-server,mysql,unsafe-optimizations,wasm --workspace --exclude otel-arrow-dfe-component-inventory --list-type binaries-only --message-format json
         working-directory: ./rust/otap-dataflow

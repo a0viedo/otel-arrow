@@ -232,6 +232,10 @@ def _find_job_url(job_url_map, run_id, meta):
     """
     if meta.get("job") in {"test_required_linux", "test_required_windows"}:
         components = [f"{meta['job']} ({meta.get('partition')})"]
+    elif meta.get("job") == "test_nonrequired":
+        components = [
+            f"test_nonrequired ({meta.get('folder')}, {meta.get('os')}, {meta.get('partition')})"
+        ]
     else:
         components = [str(v) for v in meta.values()]
     for (rid, job_name), url in job_url_map.items():

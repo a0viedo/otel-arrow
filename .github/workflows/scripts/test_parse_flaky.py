@@ -35,9 +35,9 @@ def flaky_test(name):
 
 
 class FlakyJobLinkTests(unittest.TestCase):
-    # Scenario: Required jobs use partition-only or legacy full matrices.
-    # Guarantees: Required jobs resolve without breaking existing matrix jobs.
-    def test_required_job_names_match_current_and_legacy_metadata(self):
+    # Scenario: Partition jobs have current, legacy, or reusable workflow names.
+    # Guarantees: Metadata resolves to the correct partition in the same run.
+    def test_job_names_match_current_and_legacy_metadata(self):
         cases = [
             ("test_required_linux", "ubuntu-latest",
              "test_required_linux (2)"),
@@ -47,6 +47,8 @@ class FlakyJobLinkTests(unittest.TestCase):
              "test_required (otap-dataflow, ubuntu-latest, 2)"),
             ("test_nonrequired", "macos-latest",
              "test_nonrequired (otap-dataflow, macos-latest, 2)"),
+            ("test_nonrequired", "ubuntu-24.04-arm",
+             "nonrequired_tests (ubuntu-24.04-arm) / test_nonrequired (otap-dataflow, ubuntu-24.04-arm, 2)"),
         ]
         for job, os_name, display_name in cases:
             with self.subTest(job=job):
