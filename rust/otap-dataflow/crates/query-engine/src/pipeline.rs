@@ -96,9 +96,16 @@ pub trait PipelineStage {
     /// Not all pipeline stages are required to support this, and the default is that it is not
     /// supported. If an type chooses to implement this, it should also implement
     /// `supports_exec_on_attributes` and return `true`.
+    ///
+    /// `parent_batch` is the OTAP batch that contains the attributes. It is provided so that
+    /// expressions evaluating on properties of the whole batch (e.g. its signal type or its
+    /// metadata) can be evaluated. Its attributes payload may not reflect the changes made by
+    /// previous stages of the nested pipeline, so the attributes must always be read from
+    /// `attrs_record_batch`.
     async fn execute_on_attributes(
         &mut self,
         _attrs_record_batch: RecordBatch,
+        _parent_batch: &OtapArrowRecords,
         _session_context: &SessionContext,
         _config_options: &ConfigOptions,
         _task_context: Arc<TaskContext>,

@@ -168,13 +168,47 @@ impl ScopedExpr {
     /// Used for nested attribute pipelines where the "root" is the attributes batch itself
     /// (e.g., `logs | apply attributes { set value = value + 2 }`).
     ///
-    /// Supports `Eval(DatafusionExpr)` nodes only
+    /// `parent_batch` is the OTAP batch containing the attributes. It is only used to evaluate
+    /// expressions on properties of the whole batch (`LeafEval::BatchEval`), such as
+    /// `is Log` or `has_transport_header("foo")`, which produce a scalar applying to every
+    /// attribute.
+    ///
+    /// Supports `Eval`, `JoinAndEval` and `BitmapNot` nodes. In attributes mode, every node
+    /// evaluates on the rows of the same attributes batch, so the results of the children of a
+    /// `JoinAndEval` are already aligned and are combined without a join. `BitmapAnd` and
+    /// `BitmapOr` are only planned for predicates on the attributes of a record, which are
+    /// not available in attributes mode, so they are not supported.
     pub(crate) fn evaluate_on_attrs_batch(
         &mut self,
         attrs_record_batch: &RecordBatch,
+        parent_batch: &OtapArrowRecords,
         eval_ctx: &EvalContext<'_>,
     ) -> Result<ColumnarValue> {
         match self {
+            Self::Eval {
+                eval: LeafEval::BatchEval(batch_eval),
+                ..
+            } => Ok(ColumnarValue::Scalar(
+                batch_eval.evaluate(parent_batch, eval_ctx)?,
+            )),
+            Self::JoinAndEval {
+                children,
+                eval,
+                short_circuit,
+                ..
+            } => join_and_eval_on_attrs_batch(
+                children,
+                eval,
+                short_circuit.as_ref(),
+                attrs_record_batch,
+                parent_batch,
+                eval_ctx,
+            ),
+            Self::BitmapNot(child) => {
+                let child_result =
+                    child.evaluate_on_attrs_batch(attrs_record_batch, parent_batch, eval_ctx)?;
+                invert_attrs_predicate(child_result)
+            }
             Self::Eval {
                 eval:
                     LeafEval::DatafusionExpr {
@@ -198,11 +232,130 @@ impl ScopedExpr {
                     })),
                 }
             }
-            _ => Err(Error::InvalidPipelineError {
-                cause: "only Eval(DatafusionExpr) can be evaluated on a provided batch".into(),
+            Self::BitmapAnd(_, _) | Self::BitmapOr(_, _) => Err(Error::InvalidPipelineError {
+                cause: "BitmapAnd and BitmapOr cannot be evaluated on a provided batch".into(),
                 query_location: None,
             }),
         }
+    }
+}
+
+/// Evaluate a `JoinAndEval` node on an attributes batch (see
+/// [`ScopedExpr::evaluate_on_attrs_batch`]).
+///
+/// Each child is evaluated on the same attributes batch, so the results are aligned with its
+/// rows. Scalar results (such as the result of a `BatchEval`) are broadcast to every row, then
+/// the children's results are combined into the input batch of the DataFusion expression.
+fn join_and_eval_on_attrs_batch(
+    children: &mut [ScopedExpr],
+    eval: &mut LeafEval,
+    short_circuit: Option<&ShortCircuitStrategy>,
+    attrs_record_batch: &RecordBatch,
+    parent_batch: &OtapArrowRecords,
+    eval_ctx: &EvalContext<'_>,
+) -> Result<ColumnarValue> {
+    let LeafEval::DatafusionExpr {
+        logical_expr,
+        physical_expr,
+        projection,
+        projection_opts,
+        eval_anyval_as_struct,
+        attr_key_case_sensitive: _,
+        missing_data_passes,
+    } = eval
+    else {
+        return Err(Error::ExecutionError {
+            cause: "JoinAndEval requires a DatafusionExpr leaf evaluation".into(),
+        });
+    };
+
+    let num_rows = attrs_record_batch.num_rows();
+    let mut fields = Vec::with_capacity(children.len());
+    let mut columns = Vec::with_capacity(children.len());
+    for (i, child) in children.iter_mut().enumerate() {
+        let values = child.evaluate_on_attrs_batch(attrs_record_batch, parent_batch, eval_ctx)?;
+
+        // Every row of the attributes batch has a result, so the result determines the outcome
+        // the same way it would for a record-scoped value.
+        if let Some(strategy) = short_circuit
+            && strategy.should_short_circuit(&DataScope::Record(RecordScope::Signal), &values)
+        {
+            return Ok(strategy.value().values);
+        }
+
+        let column = values.to_array(num_rows)?;
+        fields.push(Field::new(
+            arg_column_name(i),
+            column.data_type().clone(),
+            true,
+        ));
+        columns.push(column);
+    }
+
+    let joined_rb = RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )?;
+
+    let Some(projected_rb) = projection.project_with_options(&joined_rb, projection_opts)? else {
+        return Ok(ColumnarValue::Scalar(ScalarValue::Null));
+    };
+
+    let any_value_indices = find_any_value_columns(projected_rb.schema_ref());
+    let result_vals = if any_value_indices.is_empty() || *eval_anyval_as_struct {
+        evaluate_df_expr(logical_expr, physical_expr, eval_ctx, &projected_rb)?
+    } else {
+        evaluate_with_anyval_partitions(
+            logical_expr,
+            physical_expr,
+            projection_opts,
+            eval_ctx,
+            &projected_rb,
+            &any_value_indices,
+        )?
+    };
+
+    Ok(coerce_nulls_for_predicate(
+        result_vals,
+        *missing_data_passes,
+    ))
+}
+
+/// Invert the boolean result of a predicate evaluated on an attributes batch.
+///
+/// Consistent with how a `BitmapNot` is evaluated on records, a null result (e.g. the data the
+/// predicate reads is absent) is treated as not matching the predicate, so it becomes `true`
+/// once inverted.
+fn invert_attrs_predicate(values: ColumnarValue) -> Result<ColumnarValue> {
+    match values {
+        ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(!b))))
+        }
+        ColumnarValue::Scalar(ScalarValue::Boolean(None) | ScalarValue::Null) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))
+        }
+        ColumnarValue::Array(arr) => {
+            let bool_arr = arr.as_boolean_opt().ok_or_else(|| Error::ExecutionError {
+                cause: format!(
+                    "expected boolean array to invert predicate, got {:?}",
+                    arr.data_type()
+                ),
+            })?;
+            let matches = match bool_arr.nulls() {
+                Some(nulls) => bool_arr.values() & nulls.inner(),
+                None => bool_arr.values().clone(),
+            };
+            Ok(ColumnarValue::Array(Arc::new(BooleanArray::new(
+                !&matches, None,
+            ))))
+        }
+        ColumnarValue::Scalar(other) => Err(Error::ExecutionError {
+            cause: format!(
+                "expected boolean scalar to invert predicate, got {:?}",
+                other.data_type()
+            ),
+        }),
     }
 }
 
@@ -440,6 +593,15 @@ pub(super) fn join_and_eval_value(
         child_results.push(result)
     }
 
+    // When every child is a scalar (e.g. `has_transport_header("foo") and is Log`), the result
+    // is the same for every record, so there is nothing to join: evaluate the expression once.
+    if child_results
+        .iter()
+        .all(|sv| matches!(sv.values, ColumnarValue::Scalar(_)))
+    {
+        return eval_on_scalar_children(child_results, eval, eval_ctx);
+    }
+
     // convert ScopedValues to JoinInputs for the join boundary
     let join_inputs: Vec<JoinInput> = child_results
         .into_iter()
@@ -501,6 +663,62 @@ pub(super) fn join_and_eval_value(
     );
 
     Ok(Some(result))
+}
+
+/// Evaluate the expression of a `JoinAndEval` node whose children all produced scalar values.
+///
+/// The children's values become the columns of a single row batch on which the expression is
+/// evaluated, and the result is returned as a static scalar that applies to every record.
+fn eval_on_scalar_children(
+    child_results: Vec<ScopedValue>,
+    eval: &mut LeafEval,
+    eval_ctx: &EvalContext<'_>,
+) -> Result<Option<ScopedValue>> {
+    let LeafEval::DatafusionExpr {
+        logical_expr,
+        projection,
+        projection_opts,
+        missing_data_passes,
+        ..
+    } = eval
+    else {
+        return Err(Error::ExecutionError {
+            cause: "JoinAndEval requires a DatafusionExpr leaf evaluation".into(),
+        });
+    };
+
+    let mut fields = Vec::with_capacity(child_results.len());
+    let mut columns = Vec::with_capacity(child_results.len());
+    for (i, child_result) in child_results.into_iter().enumerate() {
+        let column = child_result.values.to_array(1)?;
+        fields.push(Field::new(
+            arg_column_name(i),
+            column.data_type().clone(),
+            true,
+        ));
+        columns.push(column);
+    }
+    let scalars_rb = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+
+    let Some(projected_rb) = projection.project_with_options(&scalars_rb, projection_opts)? else {
+        return Ok(None);
+    };
+
+    // The physical expression is planned for this evaluation only rather than cached in the
+    // `LeafEval` because the types of the scalar columns may not be the types of the columns
+    // when the children produce arrays for a later batch.
+    let value = match evaluate_df_expr(logical_expr, &mut None, eval_ctx, &projected_rb)? {
+        ColumnarValue::Scalar(value) => value,
+        ColumnarValue::Array(values) => ScalarValue::try_from_array(&values, 0)?,
+    };
+
+    match coerce_nulls_for_predicate(ColumnarValue::Scalar(value), *missing_data_passes) {
+        ColumnarValue::Scalar(value) if value.is_null() => Ok(None),
+        ColumnarValue::Scalar(value) => Ok(Some(ScopedValue::new_scalar(value))),
+        ColumnarValue::Array(_) => Err(Error::ExecutionError {
+            cause: "expected scalar result when evaluating scalar children".into(),
+        }),
+    }
 }
 
 /// When one child of a 2-child OR/NotOr `JoinAndEval` is absent (returns `None`), the

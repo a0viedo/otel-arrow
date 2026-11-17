@@ -408,6 +408,7 @@ impl PipelineStage for ConditionalPipelineStage {
     async fn execute_on_attributes(
         &mut self,
         attrs_record_batch: RecordBatch,
+        parent_batch: &OtapArrowRecords,
         session_ctx: &SessionContext,
         config_options: &ConfigOptions,
         task_context: Arc<TaskContext>,
@@ -438,6 +439,7 @@ impl PipelineStage for ConditionalPipelineStage {
             // evaluate the branch condition directly on the attributes record batch
             let predicate = branch.condition.evaluate_on_attrs_batch(
                 &attrs_record_batch,
+                parent_batch,
                 &EvalContext::new(session_ctx, exec_state),
             )?;
             let predicate_selection_vec =
@@ -458,6 +460,7 @@ impl PipelineStage for ConditionalPipelineStage {
                 branch_record_batch = stage
                     .execute_on_attributes(
                         branch_record_batch,
+                        parent_batch,
                         session_ctx,
                         config_options,
                         task_context.clone(),
@@ -480,6 +483,7 @@ impl PipelineStage for ConditionalPipelineStage {
                     default_branch_batch = stage
                         .execute_on_attributes(
                             default_branch_batch,
+                            parent_batch,
                             session_ctx,
                             config_options,
                             task_context.clone(),

@@ -2196,6 +2196,14 @@ fn is_literal_eval(plan: &PlannedOp) -> bool {
 /// Try to combine the scopes of two `PlannedOp`s. Returns `Some(scope)` if they're
 /// combinable (same scope or one is scalar), `None` if they require a join.
 fn try_combine_scopes(left: &PlannedOp, right: &PlannedOp) -> Option<DataScope> {
+    // Only `Eval(DatafusionExpr)` nodes can be merged into a single DataFusion expression.
+    // Other `Eval` nodes, such as a `BatchEval` evaluating a property of the whole batch (e.g.
+    // `is Log` or `has_transport_header("foo")`), may have a combinable scope but have no
+    // DataFusion expression to merge, so they must be combined with a `JoinAndEval`.
+    if left.expr.as_df_eval_expr_ref().is_none() || right.expr.as_df_eval_expr_ref().is_none() {
+        return None;
+    }
+
     let left_scope = left.expr.eval_scope()?;
     let right_scope = right.expr.eval_scope()?;
 

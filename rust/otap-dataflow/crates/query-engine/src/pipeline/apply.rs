@@ -88,6 +88,7 @@ impl ApplyPipelineStage {
             curr_batch = pipeline_stage
                 .execute_on_attributes(
                     curr_batch,
+                    &otap_batch,
                     session_context,
                     config_options,
                     Arc::clone(&task_context),

@@ -108,6 +108,7 @@ impl PipelineStage for FilterPipelineStage {
     async fn execute_on_attributes(
         &mut self,
         attrs_record_batch: RecordBatch,
+        parent_batch: &OtapArrowRecords,
         session_context: &SessionContext,
         _config_options: &ConfigOptions,
         _task_context: Arc<TaskContext>,
@@ -120,6 +121,7 @@ impl PipelineStage for FilterPipelineStage {
 
         let result = self.predicate.evaluate_on_attrs_batch(
             &attrs_record_batch,
+            parent_batch,
             &EvalContext::new(session_context, exec_state),
         )?;
 
