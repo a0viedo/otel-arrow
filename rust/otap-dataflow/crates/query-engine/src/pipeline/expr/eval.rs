@@ -168,13 +168,47 @@ impl ScopedExpr {
     /// Used for nested attribute pipelines where the "root" is the attributes batch itself
     /// (e.g., `logs | apply attributes { set value = value + 2 }`).
     ///
-    /// Supports `Eval(DatafusionExpr)` nodes only
+    /// `parent_batch` is the OTAP batch containing the attributes. It is only used to evaluate
+    /// expressions on properties of the whole batch (`LeafEval::BatchEval`), such as
+    /// `is Log` or `has_transport_header("foo")`, which produce a scalar applying to every
+    /// attribute.
+    ///
+    /// Supports `Eval`, `JoinAndEval` and `BitmapNot` nodes. In attributes mode, every node
+    /// evaluates on the rows of the same attributes batch, so the results of the children of a
+    /// `JoinAndEval` are already aligned and are combined without a join. `BitmapAnd` and
+    /// `BitmapOr` are only planned for predicates on the attributes of a record, which are
+    /// not available in attributes mode, so they are not supported.
     pub(crate) fn evaluate_on_attrs_batch(
         &mut self,
         attrs_record_batch: &RecordBatch,
+        parent_batch: &OtapArrowRecords,
         eval_ctx: &EvalContext<'_>,
     ) -> Result<ColumnarValue> {
         match self {
+            Self::Eval {
+                eval: LeafEval::BatchEval(batch_eval),
+                ..
+            } => Ok(ColumnarValue::Scalar(
+                batch_eval.evaluate(parent_batch, eval_ctx)?,
+            )),
+            Self::JoinAndEval {
+                children,
+                eval,
+                short_circuit,
+                ..
+            } => join_and_eval_on_attrs_batch(
+                children,
+                eval,
+                short_circuit.as_ref(),
+                attrs_record_batch,
+                parent_batch,
+                eval_ctx,
+            ),
+            Self::BitmapNot(child) => {
+                let child_result =
+                    child.evaluate_on_attrs_batch(attrs_record_batch, parent_batch, eval_ctx)?;
+                invert_attrs_predicate(child_result)
+            }
             Self::Eval {
                 eval:
                     LeafEval::DatafusionExpr {
@@ -198,11 +232,125 @@ impl ScopedExpr {
                     })),
                 }
             }
-            _ => Err(Error::InvalidPipelineError {
-                cause: "only Eval(DatafusionExpr) can be evaluated on a provided batch".into(),
+            Self::BitmapAnd(_, _) | Self::BitmapOr(_, _) => Err(Error::InvalidPipelineError {
+                cause: "BitmapAnd and BitmapOr cannot be evaluated on a provided batch".into(),
                 query_location: None,
             }),
         }
+    }
+}
+
+/// Evaluate a `JoinAndEval` node on an attributes batch (see
+/// [`ScopedExpr::evaluate_on_attrs_batch`]).
+///
+/// Each child is evaluated on the same attributes batch, so the results are aligned with its
+/// rows. Scalar results (such as the result of a `BatchEval`) are broadcast to every row, then
+/// the children's results are combined into the input batch of the DataFusion expression.
+fn join_and_eval_on_attrs_batch(
+    children: &mut [ScopedExpr],
+    eval: &mut LeafEval,
+    short_circuit: Option<&ShortCircuitStrategy>,
+    attrs_record_batch: &RecordBatch,
+    parent_batch: &OtapArrowRecords,
+    eval_ctx: &EvalContext<'_>,
+) -> Result<ColumnarValue> {
+    let LeafEval::DatafusionExpr {
+        logical_expr,
+        physical_expr,
+        projection,
+        projection_opts,
+        eval_anyval_as_struct,
+        attr_key_case_sensitive: _,
+        missing_data_passes,
+    } = eval
+    else {
+        return Err(Error::ExecutionError {
+            cause: "JoinAndEval requires a DatafusionExpr leaf evaluation".into(),
+        });
+    };
+
+    let num_rows = attrs_record_batch.num_rows();
+    let mut fields = Vec::with_capacity(children.len());
+    let mut columns = Vec::with_capacity(children.len());
+    for (i, child) in children.iter_mut().enumerate() {
+        let values = child.evaluate_on_attrs_batch(attrs_record_batch, parent_batch, eval_ctx)?;
+
+        // Every row of the attributes batch has a result, so the result determines the outcome
+        // the same way it would for a record-scoped value.
+        if let Some(strategy) = short_circuit
+            && strategy.should_short_circuit(&DataScope::Record(RecordScope::Signal), &values)
+        {
+            return Ok(strategy.value().values);
+        }
+
+        let column = values.to_array(num_rows)?;
+        fields.push(Field::new(
+            arg_column_name(i),
+            column.data_type().clone(),
+            true,
+        ));
+        columns.push(column);
+    }
+
+    let joined_rb = RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )?;
+
+    let Some(projected_rb) = projection.project_with_options(&joined_rb, projection_opts)? else {
+        return Ok(ColumnarValue::Scalar(ScalarValue::Null));
+    };
+
+    let result_vals = evaluate_projected_expr(
+        logical_expr,
+        physical_expr,
+        projection_opts,
+        *eval_anyval_as_struct,
+        eval_ctx,
+        &projected_rb,
+    )?;
+
+    Ok(coerce_nulls_for_predicate(
+        result_vals,
+        *missing_data_passes,
+    ))
+}
+
+/// Invert the boolean result of a predicate evaluated on an attributes batch.
+///
+/// Consistent with how a `BitmapNot` is evaluated on records, a null result (e.g. the data the
+/// predicate reads is absent) is treated as not matching the predicate, so it becomes `true`
+/// once inverted.
+fn invert_attrs_predicate(values: ColumnarValue) -> Result<ColumnarValue> {
+    match values {
+        ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(!b))))
+        }
+        ColumnarValue::Scalar(ScalarValue::Boolean(None) | ScalarValue::Null) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))
+        }
+        ColumnarValue::Array(arr) => {
+            let bool_arr = arr.as_boolean_opt().ok_or_else(|| Error::ExecutionError {
+                cause: format!(
+                    "expected boolean array to invert predicate, got {:?}",
+                    arr.data_type()
+                ),
+            })?;
+            let matches = match bool_arr.nulls() {
+                Some(nulls) => bool_arr.values() & nulls.inner(),
+                None => bool_arr.values().clone(),
+            };
+            Ok(ColumnarValue::Array(Arc::new(BooleanArray::new(
+                !&matches, None,
+            ))))
+        }
+        ColumnarValue::Scalar(other) => Err(Error::ExecutionError {
+            cause: format!(
+                "expected boolean scalar to invert predicate, got {:?}",
+                other.data_type()
+            ),
+        }),
     }
 }
 
@@ -480,19 +628,14 @@ pub(super) fn join_and_eval_value(
     };
 
     // handle AnyValue columns
-    let any_value_indices = find_any_value_columns(projected_rb.schema_ref());
-    let mut result_vals = if any_value_indices.is_empty() || *eval_anyval_as_struct {
-        evaluate_df_expr(logical_expr, physical_expr, eval_ctx, &projected_rb)?
-    } else {
-        evaluate_with_anyval_partitions(
-            logical_expr,
-            physical_expr,
-            projection_opts,
-            eval_ctx,
-            &projected_rb,
-            &any_value_indices,
-        )?
-    };
+    let mut result_vals = evaluate_projected_expr(
+        logical_expr,
+        physical_expr,
+        projection_opts,
+        *eval_anyval_as_struct,
+        eval_ctx,
+        &projected_rb,
+    )?;
 
     // if we evaluated the expression on a unit length record batch comprised of scalar result
     // values, convert the back into a scalar value
@@ -734,6 +877,30 @@ fn evaluate_df_expr(
         .evaluate(record_batch)?;
 
     Ok(result)
+}
+
+/// Evaluate a projected expression, partitioning AnyValue columns when required.
+fn evaluate_projected_expr(
+    logical_expr: &Expr,
+    physical_expr: &mut Option<PhysicalExprRef>,
+    projection_opts: &ProjectionOptions,
+    eval_anyval_as_struct: bool,
+    eval_ctx: &EvalContext<'_>,
+    projected_rb: &RecordBatch,
+) -> Result<ColumnarValue> {
+    let any_value_indices = find_any_value_columns(projected_rb.schema_ref());
+    if any_value_indices.is_empty() || eval_anyval_as_struct {
+        evaluate_df_expr(logical_expr, physical_expr, eval_ctx, projected_rb)
+    } else {
+        evaluate_with_anyval_partitions(
+            logical_expr,
+            physical_expr,
+            projection_opts,
+            eval_ctx,
+            projected_rb,
+            &any_value_indices,
+        )
+    }
 }
 
 /// Evaluate a DataFusion expression on a RecordBatch that has AnyValue struct columns,

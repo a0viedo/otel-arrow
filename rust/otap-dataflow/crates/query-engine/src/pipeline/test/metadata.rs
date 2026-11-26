@@ -445,3 +445,217 @@ async fn test_metadata_access_function_result_used_in_or_expr() {
     // assert eliminated because left & right of predicate are both false
     assert!(result.is_empty());
 }
+
+/// Execute the query on a log record having the attributes `a = "1"` and `b = "2"`, with or
+/// without the transport header "foo" in the batch metadata, and return the attributes of the
+/// log record in the result, sorted by key.
+async fn execute_on_log_attrs(query: &str, with_header: bool) -> Vec<KeyValue> {
+    let pipeline_options = PipelineOptions {
+        node_bindings: Arc::new(node_bindings_for_transport_header("foo")),
+        ..Default::default()
+    };
+    let mut metadata = Metadata::default();
+    if with_header {
+        add_transport_header(&mut metadata, "foo", "bar");
+    }
+    let input_batch = create_single_row_log_batch(vec![
+        KeyValue::new("a", AnyValue::new_string("1")),
+        KeyValue::new("b", AnyValue::new_string("2")),
+    ]);
+
+    let result = execute_pipeline(query, pipeline_options, input_batch, metadata).await;
+    let OtlpProtoMessage::Logs(result) = otap_to_otlp(&result) else {
+        panic!("wrong signal type")
+    };
+    let log_records = &result.resource_logs[0].scope_logs[0].log_records;
+    assert_eq!(log_records.len(), 1, "the log record should not be removed");
+    let mut attrs = log_records[0].attributes.clone();
+    attrs.sort_by(|left, right| left.key.cmp(&right.key));
+    attrs
+}
+
+/// Scenario: a metadata access function is the predicate of a filter in a nested attributes
+/// pipeline, on its own and inverted with "not"
+/// Guarantees: all of the attributes are kept or removed depending on whether the batch has the
+/// transport header, and the log record itself is kept
+#[tokio::test]
+async fn test_filter_nested_attrs_by_transport_header() {
+    let all_attrs = vec![
+        KeyValue::new("a", AnyValue::new_string("1")),
+        KeyValue::new("b", AnyValue::new_string("2")),
+    ];
+
+    let query = "signals | apply attributes { where has_transport_header(\"foo\") }";
+    assert_eq!(execute_on_log_attrs(query, true).await, all_attrs);
+    assert_eq!(execute_on_log_attrs(query, false).await, vec![]);
+
+    let query = "signals | apply attributes { where not(has_transport_header(\"foo\")) }";
+    assert_eq!(execute_on_log_attrs(query, true).await, vec![]);
+    assert_eq!(execute_on_log_attrs(query, false).await, all_attrs);
+}
+
+/// Scenario: a metadata access function is combined with a predicate on the attribute key using
+/// "and"/"or" in the filter of a nested attributes pipeline
+/// Guarantees: the combined predicate is planned and evaluated per attribute, with the metadata
+/// function's result applying to every attribute
+#[tokio::test]
+async fn test_filter_nested_attrs_by_transport_header_and_key() {
+    let attr_a = KeyValue::new("a", AnyValue::new_string("1"));
+    let attr_b = KeyValue::new("b", AnyValue::new_string("2"));
+
+    let query =
+        "signals | apply attributes { where key == \"a\" and has_transport_header(\"foo\") }";
+    assert_eq!(
+        execute_on_log_attrs(query, true).await,
+        vec![attr_a.clone()]
+    );
+    assert_eq!(execute_on_log_attrs(query, false).await, vec![]);
+
+    let query =
+        "signals | apply attributes { where key == \"a\" or has_transport_header(\"foo\") }";
+    assert_eq!(
+        execute_on_log_attrs(query, true).await,
+        vec![attr_a.clone(), attr_b]
+    );
+    assert_eq!(execute_on_log_attrs(query, false).await, vec![attr_a]);
+}
+
+/// Scenario: a metadata access function is the condition of an "if" in a nested attributes
+/// pipeline, and its result is assigned to the attribute values
+/// Guarantees: the branch is applied to every attribute only when the batch has the transport
+/// header, and the assigned value is the function's result for every attribute
+#[tokio::test]
+async fn test_conditional_and_assign_nested_attrs_by_transport_header() {
+    let query =
+        "signals | apply attributes { if (has_transport_header(\"foo\")) { set value = \"x\" } }";
+    assert_eq!(
+        execute_on_log_attrs(query, true).await,
+        vec![
+            KeyValue::new("a", AnyValue::new_string("x")),
+            KeyValue::new("b", AnyValue::new_string("x")),
+        ]
+    );
+    assert_eq!(
+        execute_on_log_attrs(query, false).await,
+        vec![
+            KeyValue::new("a", AnyValue::new_string("1")),
+            KeyValue::new("b", AnyValue::new_string("2")),
+        ]
+    );
+
+    let query = "signals | apply attributes { set value = has_transport_header(\"foo\") }";
+    for with_header in [true, false] {
+        assert_eq!(
+            execute_on_log_attrs(query, with_header).await,
+            vec![
+                KeyValue::new("a", AnyValue::new_bool(with_header)),
+                KeyValue::new("b", AnyValue::new_bool(with_header)),
+            ]
+        );
+    }
+}
+
+/// Scenario: the signal type check ("is Log"/"is Span") is the predicate of a filter in a nested
+/// attributes pipeline, on its own and combined with a predicate on the attribute key
+/// Guarantees: the check is evaluated on the signal type of the batch containing the attributes
+#[tokio::test]
+async fn test_filter_nested_attrs_by_signal_type() {
+    let attr_a = KeyValue::new("a", AnyValue::new_string("1"));
+    let attr_b = KeyValue::new("b", AnyValue::new_string("2"));
+
+    let query = "signals | apply attributes { where is Log }";
+    assert_eq!(
+        execute_on_log_attrs(query, false).await,
+        vec![attr_a.clone(), attr_b.clone()]
+    );
+
+    let query = "signals | apply attributes { where is Span }";
+    assert_eq!(execute_on_log_attrs(query, false).await, vec![]);
+
+    let query = "signals | apply attributes { where key == \"a\" and is Log }";
+    assert_eq!(
+        execute_on_log_attrs(query, false).await,
+        vec![attr_a.clone()]
+    );
+
+    let query = "signals | apply attributes { where key == \"a\" or is Span }";
+    assert_eq!(execute_on_log_attrs(query, false).await, vec![attr_a]);
+}
+
+/// Scenario: an earlier attribute filter removes a row before a mixed batch predicate runs.
+/// Guarantees: the later stage evaluates the current attributes without restoring removed rows.
+#[tokio::test]
+async fn test_nested_attrs_batch_predicate_uses_current_rows() {
+    let query = r#"signals | apply attributes {
+        where key == "a"
+        | where key == "b" or has_transport_header("foo")
+    }"#;
+    assert_eq!(
+        execute_on_log_attrs(query, true).await,
+        vec![KeyValue::new("a", AnyValue::new_string("1"))]
+    );
+    assert!(execute_on_log_attrs(query, false).await.is_empty());
+}
+
+/// Scenario: a batch predicate filters attributes belonging to multiple log records.
+/// Guarantees: all parent records remain and their attributes follow the header predicate.
+#[tokio::test]
+async fn test_nested_attrs_batch_predicate_preserves_multiple_records() {
+    let pipeline_options = PipelineOptions {
+        node_bindings: Arc::new(node_bindings_for_transport_header("foo")),
+        ..Default::default()
+    };
+    let records = (0..2)
+        .map(|i| {
+            LogRecord::build()
+                .event_name(format!("event.{i}"))
+                .attributes(vec![KeyValue::new("a", AnyValue::new_string("1"))])
+                .finish()
+        })
+        .collect();
+    let input = otlp_to_otap(&OtlpProtoMessage::Logs(to_logs_data(records)));
+    for with_header in [true, false] {
+        let mut metadata = Metadata::default();
+        if with_header {
+            add_transport_header(&mut metadata, "foo", "bar");
+        }
+        let result = execute_pipeline(
+            r#"signals | apply attributes { where has_transport_header("foo") }"#,
+            pipeline_options.clone(),
+            input.clone(),
+            metadata,
+        )
+        .await;
+        let OtlpProtoMessage::Logs(logs) = otap_to_otlp(&result) else {
+            panic!("wrong signal type")
+        };
+        let records = &logs.resource_logs[0].scope_logs[0].log_records;
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert_eq!(record.attributes.len(), usize::from(with_header));
+        }
+    }
+}
+
+/// Scenario: a batch predicate is applied to a log record without attributes.
+/// Guarantees: the record remains present with no attributes.
+#[tokio::test]
+async fn test_nested_attrs_batch_predicate_without_attributes() {
+    let options = PipelineOptions {
+        node_bindings: Arc::new(node_bindings_for_transport_header("foo")),
+        ..Default::default()
+    };
+    let result = execute_pipeline(
+        r#"signals | apply attributes { where has_transport_header("foo") }"#,
+        options,
+        create_single_row_log_batch(vec![]),
+        Metadata::default(),
+    )
+    .await;
+    let OtlpProtoMessage::Logs(logs) = otap_to_otlp(&result) else {
+        panic!("wrong signal type")
+    };
+    let records = &logs.resource_logs[0].scope_logs[0].log_records;
+    assert_eq!(records.len(), 1);
+    assert!(records[0].attributes.is_empty());
+}

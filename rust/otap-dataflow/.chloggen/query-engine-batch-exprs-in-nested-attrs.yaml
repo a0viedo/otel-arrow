@@ -1,0 +1,4 @@
+change_type: bug_fix
+component: query-engine
+note: Support batch metadata functions and signal type checks in nested attribute pipelines.
+issues: [4719]

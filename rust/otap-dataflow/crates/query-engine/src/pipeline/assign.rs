@@ -1241,10 +1241,12 @@ impl PipelineStage for AssignPipelineStage {
     /// ```
     ///
     /// Effectively what this means is the only types of expressions that will be evaluated are
-    /// those which reference the virtual "value" column and/or static literals.
+    /// those which reference the virtual "value" column, static literals and/or properties of
+    /// the whole batch (e.g. `has_transport_header("foo")`).
     async fn execute_on_attributes(
         &mut self,
         attrs_record_batch: RecordBatch,
+        parent_batch: &OtapArrowRecords,
         session_context: &SessionContext,
         _config_options: &ConfigOptions,
         _task_context: Arc<TaskContext>,
@@ -1292,6 +1294,7 @@ impl PipelineStage for AssignPipelineStage {
         let mut result = self.sources[0]
             .evaluate_on_attrs_batch(
                 &attrs_record_batch,
+                parent_batch,
                 &EvalContext::new(session_context, exec_state),
             )?
             .to_array(attrs_record_batch.num_rows())?;

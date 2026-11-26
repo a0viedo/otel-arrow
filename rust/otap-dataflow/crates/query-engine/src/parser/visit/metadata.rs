@@ -203,4 +203,14 @@ mod tests {
         let declarations = declarations_for_query(r#"signals | where attributes["x"] == "y""#);
         assert!(declarations.is_empty());
     }
+
+    /// Scenario: a transport header is referenced only inside an attribute pipeline.
+    /// Guarantees: the metadata declaration contains the header selector.
+    #[test]
+    fn nested_attribute_pipeline_declares_metadata_access() {
+        let declarations = declarations_for_query(
+            r#"signals | apply attributes { where has_transport_header("foo") }"#,
+        );
+        assert_eq!(unwrap_entries(declarations), vec![header_selector("foo")]);
+    }
 }

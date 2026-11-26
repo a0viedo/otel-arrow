@@ -88,6 +88,7 @@ impl ApplyPipelineStage {
             curr_batch = pipeline_stage
                 .execute_on_attributes(
                     curr_batch,
+                    &otap_batch,
                     session_context,
                     config_options,
                     Arc::clone(&task_context),
@@ -360,6 +361,35 @@ mod test {
             &[OtlpProtoMessage::Logs(result)],
             &[OtlpProtoMessage::Logs(expected)],
         )
+    }
+
+    /// Scenario: a signal type predicate filters resource attributes in a nested pipeline.
+    /// Guarantees: attributes follow the containing batch's signal type and records remain.
+    #[tokio::test]
+    async fn test_resource_attributes_batch_predicate() {
+        let input = LogsData::new(vec![ResourceLogs::new(
+            Resource::build()
+                .attributes(vec![KeyValue::new("ka", AnyValue::new_string("a"))])
+                .finish(),
+            vec![ScopeLogs::new(
+                InstrumentationScope::build().finish(),
+                vec![LogRecord::build().finish()],
+            )],
+        )]);
+        for (predicate, expected_count) in [("is Log", 1), ("is Span", 0)] {
+            let query = format!("logs | apply resource.attributes {{ where {predicate} }}");
+            let result = exec_logs_pipeline::<OplParser>(&query, input.clone()).await;
+            assert_eq!(
+                result.resource_logs[0]
+                    .resource
+                    .as_ref()
+                    .unwrap()
+                    .attributes
+                    .len(),
+                expected_count
+            );
+            assert_eq!(result.resource_logs[0].scope_logs[0].log_records.len(), 1);
+        }
     }
 
     #[tokio::test]
